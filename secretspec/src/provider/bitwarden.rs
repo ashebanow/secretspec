@@ -3,6 +3,7 @@ use crate::{Result, SecretSpecError};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::process::Command;
+use std::time::{Duration, Instant};
 use url::Url;
 
 /// Bitwarden service type enum for distinguishing between Password Manager and Secrets Manager
@@ -117,6 +118,7 @@ impl BitwardenItemType {
     }
 
     /// Get string representation
+    #[allow(dead_code)]
     pub fn as_str(&self) -> &'static str {
         match self {
             BitwardenItemType::Login => "login",
@@ -175,6 +177,7 @@ impl BitwardenFieldType {
     }
 
     /// Get string representation
+    #[allow(dead_code)]
     pub fn as_str(&self) -> &'static str {
         match self {
             BitwardenFieldType::Text => "text",
@@ -189,6 +192,7 @@ impl BitwardenFieldType {
 /// This struct deserializes the JSON output from the `bw get item` and `bw list items` commands.
 /// It supports all Bitwarden item types: Login, Secure Note, Card, Identity, etc.
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct BitwardenItem {
     /// Unique identifier for the item.
     id: String,
@@ -341,6 +345,7 @@ struct BitwardenSshKey {
 /// or boolean values. The field's name is used to identify specific
 /// data within an item.
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct BitwardenField {
     /// The name/label of the field.
     name: Option<String>,
@@ -372,6 +377,7 @@ where
 /// using encoded JSON. It defines the structure and metadata for items that store secrets.
 /// Default item type is Login for better script compatibility.
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 struct BitwardenItemTemplate {
     /// The type of item (Login by default).
     #[serde(rename = "type", serialize_with = "serialize_item_type")]
@@ -404,6 +410,7 @@ struct BitwardenItemTemplate {
 }
 
 /// Custom serializer for item type
+#[allow(dead_code)]
 fn serialize_item_type<S>(
     item_type: &BitwardenItemType,
     serializer: S,
@@ -416,6 +423,7 @@ where
 
 /// Secure note configuration required for Bitwarden secure note items.
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 struct BitwardenSecureNote {
     /// Type of secure note. Always 0 for generic secure notes.
     #[serde(rename = "type")]
@@ -427,6 +435,7 @@ struct BitwardenSecureNote {
 /// Each field represents a piece of data to store in the item.
 /// Used within BitwardenItemTemplate to define the item's content.
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 struct BitwardenFieldTemplate {
     /// The name/label of the field (e.g., "project", "key", "value").
     name: String,
@@ -438,6 +447,7 @@ struct BitwardenFieldTemplate {
 }
 
 /// Custom serializer for field type
+#[allow(dead_code)]
 fn serialize_field_type<S>(
     field_type: &BitwardenFieldType,
     serializer: S,
@@ -571,6 +581,11 @@ pub struct BitwardenConfig {
     /// Default field name for storing values.
     /// Can be overridden by BITWARDEN_DEFAULT_FIELD environment variable.
     pub default_field: Option<String>,
+
+    /// Timeout in seconds for CLI commands (default: 30 seconds).
+    /// Prevents hanging CLI processes and provides better error handling.
+    /// Can be overridden by BITWARDEN_CLI_TIMEOUT environment variable.
+    pub cli_timeout: Option<u64>,
 }
 
 impl Default for BitwardenConfig {
@@ -585,6 +600,7 @@ impl Default for BitwardenConfig {
             access_token: None,
             default_item_type: Some(BitwardenItemType::Login), // Login by default
             default_field: None,
+            cli_timeout: Some(30), // 30 seconds default timeout
         }
     }
 }
@@ -642,6 +658,11 @@ impl TryFrom<&Url> for BitwardenConfig {
                             }
                         }
                         "field" => config.default_field = Some(value.into_owned()),
+                        "timeout" => {
+                            if let Ok(timeout) = value.parse::<u64>() {
+                                config.cli_timeout = Some(timeout);
+                            }
+                        }
                         _ => {} // Ignore unknown parameters
                     }
                 }
@@ -666,6 +687,11 @@ impl TryFrom<&Url> for BitwardenConfig {
                             }
                         }
                         "field" => config.default_field = Some(value.into_owned()),
+                        "timeout" => {
+                            if let Ok(timeout) = value.parse::<u64>() {
+                                config.cli_timeout = Some(timeout);
+                            }
+                        }
                         _ => {} // Ignore unknown parameters
                     }
                 }
@@ -749,6 +775,383 @@ impl BitwardenProvider {
         Self { config }
     }
 
+    /// Helper to convert any string-like type to SecretString.
+    ///
+    /// This centralizes the conversion logic and uses AsRef<str> to accept
+    /// various string types (&str, String, &String, etc.) efficiently.
+    pub(crate) fn to_secret_string<S: AsRef<str>>(value: S) -> SecretString {
+        SecretString::new(value.as_ref().into())
+    }
+
+    /// Helper to convert Option<String-like> to Option<SecretString>.
+    ///
+    /// This reduces the repetitive pattern of `.map(|s| SecretString::new(s.as_str().into()))`
+    /// to a more concise and efficient `.and_then(Self::option_to_secret_string)`.
+    pub(crate) fn option_to_secret_string<S: AsRef<str>>(opt: Option<S>) -> Option<SecretString> {
+        opt.map(Self::to_secret_string)
+    }
+
+    /// Gets the CLI timeout value from configuration or environment variable.
+    ///
+    /// Priority: environment variable > config value > default (30s)
+    pub(crate) fn get_cli_timeout(&self) -> Duration {
+        // Check environment variable first
+        if let Ok(timeout_str) = std::env::var("BITWARDEN_CLI_TIMEOUT") {
+            if let Ok(timeout_secs) = timeout_str.parse::<u64>() {
+                return Duration::from_secs(timeout_secs);
+            }
+        }
+
+        // Use config value or default
+        let timeout_secs = self.config.cli_timeout.unwrap_or(30);
+        Duration::from_secs(timeout_secs)
+    }
+
+    /// Sanitizes CLI error messages to prevent secret leakage.
+    ///
+    /// This method removes or redacts potential secrets from error messages while
+    /// preserving useful diagnostic information for users.
+    ///
+    /// # Security Considerations
+    ///
+    /// CLI error messages can sometimes contain:
+    /// - Access tokens or session keys in curl/HTTP error messages
+    /// - Secret values in JSON parsing errors
+    /// - File paths that might reveal sensitive information
+    /// - Command arguments that contain secrets
+    ///
+    /// # Arguments
+    ///
+    /// * `error_msg` - The raw error message from CLI stderr
+    ///
+    /// # Returns
+    ///
+    /// A sanitized error message safe for logging and user display
+    pub(crate) fn sanitize_error_message(&self, error_msg: &str) -> String {
+        let mut sanitized = error_msg.to_string();
+
+        // Redact file paths first to avoid false positives with secret patterns
+        sanitized = self.redact_file_paths(sanitized);
+        sanitized = self.redact_secret_patterns(sanitized);
+        sanitized = self.redact_bearer_tokens(sanitized);
+        sanitized = self.redact_base64_tokens(sanitized);
+        sanitized = self.truncate_long_message(sanitized);
+
+        sanitized
+    }
+
+    /// Redacts potential secret patterns in JSON/key-value formats.
+    pub(crate) fn redact_secret_patterns(&self, mut sanitized: String) -> String {
+        let secret_patterns = [
+            // JSON patterns: "token": "value", "key": "value"
+            ("\"token\":", "\"[REDACTED]\""),
+            ("\"key\":", "\"[REDACTED]\""),
+            ("\"secret\":", "\"[REDACTED]\""),
+            ("\"password\":", "\"[REDACTED]\""),
+            ("\"session\":", "\"[REDACTED]\""),
+            ("\"access_token\":", "\"[REDACTED]\""),
+            ("\"api_key\":", "\"[REDACTED]\""),
+            ("\"authorization\":", "\"[REDACTED]\""),
+            ("\"bearer\":", "\"[REDACTED]\""),
+            ("\"jwt\":", "\"[REDACTED]\""),
+            ("\"refresh_token\":", "\"[REDACTED]\""),
+            ("\"client_secret\":", "\"[REDACTED]\""),
+            ("\"private_key\":", "\"[REDACTED]\""),
+            ("\"client_id\":", "\"[REDACTED]\""),
+            // URL/form patterns: token=value, key=value
+            ("token=", "token=[REDACTED]"),
+            ("key=", "key=[REDACTED]"),
+            ("secret=", "secret=[REDACTED]"),
+            ("password=", "password=[REDACTED]"),
+            ("session=", "session=[REDACTED]"),
+            ("access_token=", "access_token=[REDACTED]"),
+            ("api_key=", "api_key=[REDACTED]"),
+            ("authorization=", "authorization=[REDACTED]"),
+            ("bearer=", "bearer=[REDACTED]"),
+            ("jwt=", "jwt=[REDACTED]"),
+            ("refresh_token=", "refresh_token=[REDACTED]"),
+            ("client_secret=", "client_secret=[REDACTED]"),
+            ("private_key=", "private_key=[REDACTED]"),
+            ("client_id=", "client_id=[REDACTED]"),
+            // Error message patterns: "token: value", "key: value"
+            ("token: ", "token: [REDACTED]"),
+            ("key: ", "key: [REDACTED]"),
+            ("secret: ", "secret: [REDACTED]"),
+            ("password: ", "password: [REDACTED]"),
+            ("session: ", "session: [REDACTED]"),
+            ("access_token: ", "access_token: [REDACTED]"),
+            ("api_key: ", "api_key: [REDACTED]"),
+            ("authorization: ", "authorization: [REDACTED]"),
+            ("bearer: ", "bearer: [REDACTED]"),
+            ("jwt: ", "jwt: [REDACTED]"),
+            ("refresh_token: ", "refresh_token: [REDACTED]"),
+            ("client_secret: ", "client_secret: [REDACTED]"),
+            ("private_key: ", "private_key: [REDACTED]"),
+            ("client_id: ", "client_id: [REDACTED]"),
+        ];
+
+        for (pattern, replacement) in &secret_patterns {
+            if let Some(start) = sanitized.to_lowercase().find(&pattern.to_lowercase()) {
+                let value_start = start + pattern.len();
+                if let Some(value_part) = sanitized.get(value_start..) {
+                    // Skip whitespace and quotes to get to the actual value
+                    let mut actual_value_start = 0;
+                    for (i, ch) in value_part.char_indices() {
+                        if ch != ' ' && ch != '"' {
+                            actual_value_start = i;
+                            break;
+                        }
+                    }
+
+                    if let Some(actual_value) = value_part.get(actual_value_start..) {
+                        // Find end of value (quote, comma, newline, brace, bracket)
+                        // Don't break on spaces for values like "Bearer token123"
+                        let end_chars = ['"', ',', '\n', '\r', '}', ']'];
+                        let mut end_pos = actual_value.len();
+
+                        for &end_char in &end_chars {
+                            if let Some(pos) = actual_value.find(end_char) {
+                                if pos < end_pos {
+                                    end_pos = pos;
+                                }
+                            }
+                        }
+
+                        // Only redact if value looks like a secret (>= 8 chars)
+                        if end_pos >= 8 {
+                            let before = &sanitized[..value_start + actual_value_start];
+                            let after = &sanitized[value_start + actual_value_start + end_pos..];
+                            sanitized = format!("{}{}{}", before, replacement, after);
+                        }
+                    }
+                }
+            }
+        }
+
+        sanitized
+    }
+
+    /// Redacts Bearer tokens from error messages.
+    pub(crate) fn redact_bearer_tokens(&self, mut sanitized: String) -> String {
+        if let Some(bearer_start) = sanitized.to_lowercase().find("bearer ") {
+            let token_start = bearer_start + 7;
+            if let Some(token_part) = sanitized.get(token_start..) {
+                let token_end = token_part.find(' ').unwrap_or(token_part.len().min(60));
+                if token_end >= 20 {
+                    // Typical token length
+                    let before = &sanitized[..token_start];
+                    let after = &sanitized[token_start + token_end..];
+                    sanitized = format!("{}[REDACTED]{}", before, after);
+                }
+            }
+        }
+        sanitized
+    }
+
+    /// Redacts long base64-like strings (potential tokens/keys).
+    pub(crate) fn redact_base64_tokens(&self, sanitized: String) -> String {
+        let words: Vec<String> = sanitized
+            .split_whitespace()
+            .map(|word| {
+                // Check for JWT pattern (base64.base64.base64 or base64.base64)
+                if word.contains('.') && word.len() >= 20 {
+                    let parts: Vec<&str> = word.split('.').collect();
+                    if parts.len() >= 2 && parts.iter().all(|part| {
+                        part.len() >= 4 && part.chars().all(|c| c.is_alphanumeric() || c == '+' || c == '/' || c == '=' || c == '-' || c == '_')
+                    }) {
+                        return "[REDACTED]".to_string();
+                    }
+                }
+
+                // Check for regular base64-like strings
+                if word.len() >= 20
+                   && word.chars().all(|c| c.is_alphanumeric() || c == '+' || c == '/' || c == '=' || c == '-' || c == '_')
+                   && !word.chars().all(|c| c.is_ascii_digit()) // Don't redact pure numbers
+                   && !word.chars().all(|c| c == word.chars().next().unwrap()) // Don't redact repeated chars
+                {
+                    "[REDACTED]".to_string()
+                } else {
+                    word.to_string()
+                }
+            })
+            .collect();
+        words.join(" ")
+    }
+
+    /// Redacts sensitive file paths while preserving filenames for debugging.
+    pub(crate) fn redact_file_paths(&self, sanitized: String) -> String {
+        let words: Vec<String> = sanitized
+            .split_whitespace()
+            .map(|word| {
+                // Unix paths: /path/to/file
+                if word.starts_with('/') && word.matches('/').count() >= 2 {
+                    if let Some(filename) = word.split('/').last() {
+                        if !filename.is_empty() {
+                            format!(".../{}", filename)
+                        } else {
+                            "[PATH_REDACTED]".to_string()
+                        }
+                    } else {
+                        "[PATH_REDACTED]".to_string()
+                    }
+                }
+                // Windows paths: C:\path\to\file or \\server\share\file
+                else if (word.len() >= 3
+                    && word.chars().nth(1) == Some(':')
+                    && word.chars().nth(2) == Some('\\'))
+                    || word.starts_with("\\\\")
+                {
+                    if let Some(filename) = word.split('\\').last() {
+                        if !filename.is_empty() && filename != word {
+                            format!("...\\{}", filename)
+                        } else {
+                            "[PATH_REDACTED]".to_string()
+                        }
+                    } else {
+                        "[PATH_REDACTED]".to_string()
+                    }
+                } else {
+                    word.to_string()
+                }
+            })
+            .collect();
+        words.join(" ")
+    }
+
+    /// Truncates overly long error messages for security and readability.
+    pub(crate) fn truncate_long_message(&self, mut sanitized: String) -> String {
+        if sanitized.len() > 500 {
+            sanitized.truncate(450);
+            sanitized.push_str("... [truncated for security]");
+        }
+        sanitized
+    }
+
+    /// Executes a command with timeout using cross-platform approach.
+    ///
+    /// This method implements proper timeout handling using threads and channels
+    /// to prevent CLI commands from hanging indefinitely. It attempts to minimize
+    /// resource leaks by using detached threads for command execution.
+    ///
+    /// # Arguments
+    ///
+    /// * `cmd` - The command to execute with configured arguments
+    ///
+    /// # Returns
+    ///
+    /// * `Result<std::process::Output>` - The command output or timeout error
+    ///
+    /// # Errors
+    ///
+    /// Returns errors for:
+    /// - Command timeout (based on configuration)
+    /// - CLI not installed
+    /// - Command execution failures
+    ///
+    /// # Resource Management
+    ///
+    /// When a timeout occurs, the spawned thread may continue running until the
+    /// CLI command completes. This is a known limitation of cross-platform timeout
+    /// implementation without external process management dependencies.
+    fn execute_command_with_timeout(&self, mut cmd: Command) -> Result<std::process::Output> {
+        use std::sync::{Arc, Mutex, mpsc};
+        use std::thread;
+        use std::time::Instant;
+
+        let timeout = self.get_cli_timeout();
+        let (tx, rx) = mpsc::channel();
+
+        // Use Arc<Mutex<Option<Child>>> to potentially store process handle for future cleanup
+        let process_handle: Arc<Mutex<Option<std::process::Child>>> = Arc::new(Mutex::new(None));
+        let process_handle_clone = Arc::clone(&process_handle);
+
+        // Spawn command execution in separate thread
+        let handle = thread::spawn(move || {
+            // Configure command for potential process management
+            let child = match cmd.spawn() {
+                Ok(mut child) => {
+                    // Store the child process handle for potential cleanup
+                    if let Ok(mut handle_guard) = process_handle_clone.lock() {
+                        *handle_guard = Some(child);
+                    } else {
+                        // If we can't store the handle, kill the child and return error
+                        let _ = child.kill();
+                        let _ = tx.send(Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "Failed to manage process handle",
+                        )));
+                        return;
+                    }
+
+                    // Get the child from the mutex to wait for it
+                    let child = process_handle_clone.lock().unwrap().take().unwrap();
+                    child
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    return;
+                }
+            };
+
+            // Wait for the process to complete and collect output
+            let result = child.wait_with_output();
+
+            // Send result through channel (ignore send errors if receiver dropped)
+            let _ = tx.send(result);
+        });
+
+        let _start_time = Instant::now();
+
+        // Wait for either completion or timeout
+        match rx.recv_timeout(timeout) {
+            Ok(Ok(output)) => {
+                // Command completed successfully, thread will naturally terminate
+                let _ = handle.join(); // Clean up the thread
+                Ok(output)
+            }
+            Ok(Err(e)) => {
+                // Command execution failed, thread will naturally terminate
+                let _ = handle.join(); // Clean up the thread
+
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    Err(SecretSpecError::ProviderOperationFailed(
+                        "Bitwarden CLI is not installed. Please install it and ensure it's in your PATH.".to_string(),
+                    ))
+                } else {
+                    Err(SecretSpecError::ProviderOperationFailed(format!(
+                        "Command execution failed: {}",
+                        e
+                    )))
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Attempt to kill the process if we still have the handle
+                if let Ok(mut handle_guard) = process_handle.lock() {
+                    if let Some(ref mut child) = handle_guard.as_mut() {
+                        let _ = child.kill(); // Best effort to stop the process
+                        let _ = child.wait(); // Clean up zombie process
+                    }
+                }
+
+                // Note: The thread may still be running briefly, but the process should be killed
+                // We don't join the thread here to avoid blocking on the cleanup
+                Err(SecretSpecError::ProviderOperationFailed(format!(
+                    "Bitwarden CLI command timed out after {} seconds. You can increase the timeout with BITWARDEN_CLI_TIMEOUT environment variable.",
+                    timeout.as_secs()
+                )))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // Thread panicked or channel closed unexpectedly
+                // Try to clean up if possible
+                let _ = handle.join();
+
+                Err(SecretSpecError::ProviderOperationFailed(
+                    "Command execution failed: internal error".to_string(),
+                ))
+            }
+        }
+    }
+
     /// Executes a Bitwarden Password Manager CLI command with proper error handling.
     ///
     /// This method handles:
@@ -772,6 +1175,13 @@ impl BitwardenProvider {
     /// - Authentication required (not logged in or unlocked)
     /// - Command execution failures
     fn execute_bw_command(&self, args: &[&str]) -> Result<String> {
+        // Performance timing if enabled
+        let start_time = if std::env::var("SECRETSPEC_PERF_LOG").is_ok() {
+            Some(Instant::now())
+        } else {
+            None
+        };
+
         let mut cmd = Command::new("bw");
 
         // Configure server if specified
@@ -781,15 +1191,15 @@ impl BitwardenProvider {
 
         cmd.args(args);
 
-        let output = match cmd.output() {
-            Ok(output) => output,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        let output = self.execute_command_with_timeout(cmd).or_else(|e| {
+            // Provide more specific error message for CLI not found
+            if e.to_string().contains("not installed") {
                 return Err(SecretSpecError::ProviderOperationFailed(
                     "Bitwarden CLI (bw) is not installed.\n\nTo install it:\n  - npm: npm install -g @bitwarden/cli\n  - Homebrew: brew install bitwarden-cli\n  - Chocolatey: choco install bitwarden-cli\n  - Download: https://bitwarden.com/help/cli/\n\nAfter installation, run 'bw login' and 'bw unlock' to authenticate.".to_string(),
                 ));
             }
-            Err(e) => return Err(e.into()),
-        };
+            Err(e)
+        })?;
 
         if !output.status.success() {
             let error_msg = String::from_utf8_lossy(&output.stderr);
@@ -807,12 +1217,26 @@ impl BitwardenProvider {
             }
 
             return Err(SecretSpecError::ProviderOperationFailed(
-                error_msg.to_string(),
+                self.sanitize_error_message(&error_msg),
             ));
         }
 
-        String::from_utf8(output.stdout)
-            .map_err(|e| SecretSpecError::ProviderOperationFailed(e.to_string()))
+        let result = String::from_utf8(output.stdout).map_err(|e| {
+            SecretSpecError::ProviderOperationFailed(self.sanitize_error_message(&e.to_string()))
+        });
+
+        // Log performance timing if enabled
+        if let Some(start) = start_time {
+            let duration = start.elapsed();
+            eprintln!(
+                "[PERF] bw {} took {:?} ({}ms)",
+                args.join(" "),
+                duration,
+                duration.as_millis()
+            );
+        }
+
+        result
     }
 
     /// Executes a Bitwarden Secrets Manager CLI command with proper error handling.
@@ -840,6 +1264,13 @@ impl BitwardenProvider {
     /// - Rate limiting issues
     /// - Command execution failures
     fn execute_bws_command(&self, args: &[&str]) -> Result<String> {
+        // Performance timing if enabled
+        let start_time = if std::env::var("SECRETSPEC_PERF_LOG").is_ok() {
+            Some(Instant::now())
+        } else {
+            None
+        };
+
         let mut cmd = Command::new("bws");
 
         // Configure access token - check config first, then environment variable
@@ -851,15 +1282,15 @@ impl BitwardenProvider {
 
         cmd.args(args);
 
-        let output = match cmd.output() {
-            Ok(output) => output,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        let output = self.execute_command_with_timeout(cmd).or_else(|e| {
+            // Provide more specific error message for CLI not found
+            if e.to_string().contains("not installed") {
                 return Err(SecretSpecError::ProviderOperationFailed(
                     "Bitwarden Secrets Manager CLI (bws) is not installed.\n\nTo install it:\n  - Cargo: cargo install bws\n  - Script: curl -sSL https://bitwarden.com/secrets/install | sh\n  - Download: https://github.com/bitwarden/sdk-sm/releases\n\nAfter installation, set BWS_ACCESS_TOKEN environment variable with your access token.".to_string(),
                 ));
             }
-            Err(e) => return Err(e.into()),
-        };
+            Err(e)
+        })?;
 
         if !output.status.success() {
             let error_msg = String::from_utf8_lossy(&output.stderr);
@@ -887,12 +1318,26 @@ impl BitwardenProvider {
 
             return Err(SecretSpecError::ProviderOperationFailed(format!(
                 "Bitwarden Secrets Manager CLI error: {}",
-                error_msg
+                self.sanitize_error_message(&error_msg)
             )));
         }
 
-        String::from_utf8(output.stdout)
-            .map_err(|e| SecretSpecError::ProviderOperationFailed(e.to_string()))
+        let result = String::from_utf8(output.stdout).map_err(|e| {
+            SecretSpecError::ProviderOperationFailed(self.sanitize_error_message(&e.to_string()))
+        });
+
+        // Log performance timing if enabled
+        if let Some(start) = start_time {
+            let duration = start.elapsed();
+            eprintln!(
+                "[PERF] bws {} took {:?} ({}ms)",
+                args.join(" "),
+                duration,
+                duration.as_millis()
+            );
+        }
+
+        result
     }
 
     /// Checks if the user is authenticated with Bitwarden.
@@ -981,6 +1426,7 @@ impl BitwardenProvider {
     /// # Returns
     ///
     /// A BitwardenItemTemplate ready for serialization
+    #[allow(dead_code)]
     fn create_item_template(
         &self,
         _project: &str,
@@ -1023,9 +1469,9 @@ impl BitwardenProvider {
     /// extracting values using smart field detection.
     fn get_from_password_manager(
         &self,
-        project: &str,
+        _project: &str,
         key: &str,
-        profile: &str,
+        _profile: &str,
     ) -> Result<Option<SecretString>> {
         // Check authentication status first
         if !self.is_authenticated()? {
@@ -1033,8 +1479,6 @@ impl BitwardenProvider {
                 "Bitwarden authentication required. Please run 'bw login' and 'bw unlock', then set the BW_SESSION environment variable.".to_string(),
             ));
         }
-
-        eprintln!("DEBUG: get_from_password_manager called for key='{}'", key);
 
         // Use Bitwarden's built-in search to find items matching the key
         let mut list_args = vec!["list", "items", "--search", key];
@@ -1048,7 +1492,39 @@ impl BitwardenProvider {
         }
 
         let output = self.execute_bw_command(&list_args)?;
-        let items: Vec<BitwardenItem> = serde_json::from_str(&output)?;
+
+        // Handle empty output (no search results)
+        let items: Vec<BitwardenItem> = if output.trim().is_empty() {
+            Vec::new()
+        } else {
+            // Performance timing for JSON parsing (equivalent to jq processing)
+            let parse_start = if std::env::var("SECRETSPEC_PERF_LOG").is_ok() {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+
+            let items: Vec<BitwardenItem> = serde_json::from_str(&output).map_err(|e| {
+                SecretSpecError::ProviderOperationFailed(format!(
+                    "Failed to parse Bitwarden search results: {}. Output was: '{}'",
+                    e,
+                    output.chars().take(100).collect::<String>()
+                ))
+            })?;
+
+            // Log JSON parsing performance (equivalent to jq timing)
+            if let Some(start) = parse_start {
+                let duration = start.elapsed();
+                eprintln!(
+                    "[PERF] JSON parse took {}μs for {} items ({}B)",
+                    duration.as_micros(),
+                    items.len(),
+                    output.len()
+                );
+            }
+
+            items
+        };
 
         // If we found items, use the first one (Bitwarden's search is already good)
         if let Some(item) = items.first() {
@@ -1103,13 +1579,19 @@ impl BitwardenProvider {
             // If specific field requested, try to find it
             if let Some(field_name) = requested_field {
                 match field_name.to_lowercase().as_str() {
-                    "password" => return Ok(login.password.as_ref().map(|p| SecretString::new(p.clone().into()))),
-                    "username" => return Ok(login.username.as_ref().map(|u| SecretString::new(u.clone().into()))),
-                    "totp" => return Ok(login.totp.as_ref().map(|t| SecretString::new(t.clone().into()))),
+                    "password" => {
+                        return Ok(Self::option_to_secret_string(login.password.as_deref()));
+                    }
+                    "username" => {
+                        return Ok(Self::option_to_secret_string(login.username.as_deref()));
+                    }
+                    "totp" => {
+                        return Ok(Self::option_to_secret_string(login.totp.as_deref()));
+                    }
                     _ => {
                         // Check custom fields for requested field name
                         if let Some(value) = self.extract_from_custom_fields(item, field_name)? {
-                            return Ok(Some(SecretString::new(value.into())));
+                            return Ok(Some(Self::to_secret_string(value)));
                         } else {
                             return Ok(None);
                         }
@@ -1125,13 +1607,13 @@ impl BitwardenProvider {
                 || hint_lower.contains("token")
             {
                 if let Some(password) = &login.password {
-                    return Ok(Some(SecretString::new(password.clone().into())));
+                    return Ok(Some(Self::to_secret_string(password)));
                 }
             }
 
             if hint_lower.contains("user") || hint_lower.contains("login") {
                 if let Some(username) = &login.username {
-                    return Ok(Some(SecretString::new(username.clone().into())));
+                    return Ok(Some(Self::to_secret_string(username)));
                 }
             }
 
@@ -1140,16 +1622,16 @@ impl BitwardenProvider {
                 || hint_lower.contains("mfa")
             {
                 if let Some(totp) = &login.totp {
-                    return Ok(Some(SecretString::new(totp.clone().into())));
+                    return Ok(Some(Self::to_secret_string(totp)));
                 }
             }
 
             // Default: prefer password, then username
             if let Some(password) = &login.password {
-                return Ok(Some(SecretString::new(password.clone().into())));
+                return Ok(Some(Self::to_secret_string(password)));
             }
             if let Some(username) = &login.username {
-                return Ok(Some(SecretString::new(username.clone().into())));
+                return Ok(Some(Self::to_secret_string(username)));
             }
         }
 
@@ -1171,22 +1653,22 @@ impl BitwardenProvider {
         // If specific field requested, check custom fields first
         if let Some(field_name) = requested_field {
             if let Some(value) = self.extract_from_custom_fields(item, field_name)? {
-                return Ok(Some(SecretString::new(value.into())));
+                return Ok(Some(Self::to_secret_string(value)));
             }
         }
 
         // Look for legacy "value" field (backward compatibility)
         if let Some(value) = self.extract_from_custom_fields(item, "value")? {
-            return Ok(Some(SecretString::new(value.into())));
+            return Ok(Some(Self::to_secret_string(value)));
         }
 
         // Look for field matching the hint
         if let Some(value) = self.extract_from_custom_fields(item, field_hint)? {
-            return Ok(Some(SecretString::new(value.into())));
+            return Ok(Some(Self::to_secret_string(value)));
         }
 
         // Fallback: return notes content
-        Ok(item.notes.as_ref().map(|notes| SecretString::new(notes.clone().into())))
+        Ok(Self::option_to_secret_string(item.notes.as_deref()))
     }
 
     /// Extracts value from Card item (type 3).
@@ -1200,15 +1682,29 @@ impl BitwardenProvider {
             // If specific field requested
             if let Some(field_name) = requested_field {
                 match field_name.to_lowercase().as_str() {
-                    "number" => return Ok(card.number.as_ref().map(|n| SecretString::new(n.clone().into()))),
-                    "code" | "cvv" | "cvc" => return Ok(card.code.as_ref().map(|c| SecretString::new(c.clone().into()))),
-                    "cardholder" | "name" => return Ok(card.cardholder_name.as_ref().map(|n| SecretString::new(n.clone().into()))),
-                    "brand" => return Ok(card.brand.as_ref().map(|b| SecretString::new(b.clone().into()))),
-                    "expmonth" | "exp_month" => return Ok(card.exp_month.as_ref().map(|m| SecretString::new(m.clone().into()))),
-                    "expyear" | "exp_year" => return Ok(card.exp_year.as_ref().map(|y| SecretString::new(y.clone().into()))),
+                    "number" => {
+                        return Ok(Self::option_to_secret_string(card.number.as_deref()));
+                    }
+                    "code" | "cvv" | "cvc" => {
+                        return Ok(Self::option_to_secret_string(card.code.as_deref()));
+                    }
+                    "cardholder" | "name" => {
+                        return Ok(Self::option_to_secret_string(
+                            card.cardholder_name.as_deref(),
+                        ));
+                    }
+                    "brand" => {
+                        return Ok(Self::option_to_secret_string(card.brand.as_deref()));
+                    }
+                    "expmonth" | "exp_month" => {
+                        return Ok(Self::option_to_secret_string(card.exp_month.as_deref()));
+                    }
+                    "expyear" | "exp_year" => {
+                        return Ok(Self::option_to_secret_string(card.exp_year.as_deref()));
+                    }
                     _ => {
                         if let Some(value) = self.extract_from_custom_fields(item, field_name)? {
-                            return Ok(Some(SecretString::new(value.into())));
+                            return Ok(Some(Self::to_secret_string(value)));
                         } else {
                             return Ok(None);
                         }
@@ -1220,7 +1716,7 @@ impl BitwardenProvider {
             let hint_lower = field_hint.to_lowercase();
             if hint_lower.contains("number") || hint_lower.contains("card") {
                 if let Some(number) = &card.number {
-                    return Ok(Some(SecretString::new(number.clone().into())));
+                    return Ok(Some(Self::to_secret_string(number)));
                 }
             }
 
@@ -1229,13 +1725,13 @@ impl BitwardenProvider {
                 || hint_lower.contains("cvc")
             {
                 if let Some(code) = &card.code {
-                    return Ok(Some(SecretString::new(code.clone().into())));
+                    return Ok(Some(Self::to_secret_string(code)));
                 }
             }
 
             // Default: return card number
             if let Some(number) = &card.number {
-                return Ok(Some(SecretString::new(number.clone().into())));
+                return Ok(Some(Self::to_secret_string(number)));
             }
         }
 
@@ -1258,15 +1754,32 @@ impl BitwardenProvider {
             // If specific field requested
             if let Some(field_name) = requested_field {
                 match field_name.to_lowercase().as_str() {
-                    "email" => return Ok(identity.email.as_ref().map(|e| SecretString::new(e.clone().into()))),
-                    "username" => return Ok(identity.username.as_ref().map(|u| SecretString::new(u.clone().into()))),
-                    "phone" => return Ok(identity.phone.as_ref().map(|p| SecretString::new(p.clone().into()))),
-                    "firstname" | "first_name" => return Ok(identity.first_name.as_ref().map(|f| SecretString::new(f.clone().into()))),
-                    "lastname" | "last_name" => return Ok(identity.last_name.as_ref().map(|l| SecretString::new(l.clone().into()))),
-                    "company" => return Ok(identity.company.as_ref().map(|c| SecretString::new(c.clone().into()))),
+                    "email" => {
+                        return Ok(identity.email.as_ref().map(Self::to_secret_string));
+                    }
+                    "username" => {
+                        return Ok(identity.username.as_ref().map(Self::to_secret_string));
+                    }
+                    "phone" => {
+                        return Ok(identity
+                            .phone
+                            .as_ref()
+                            .map(|p| SecretString::new(p.clone().into())));
+                    }
+                    "firstname" | "first_name" => {
+                        return Ok(Self::option_to_secret_string(
+                            identity.first_name.as_deref(),
+                        ));
+                    }
+                    "lastname" | "last_name" => {
+                        return Ok(Self::option_to_secret_string(identity.last_name.as_deref()));
+                    }
+                    "company" => {
+                        return Ok(Self::option_to_secret_string(identity.company.as_deref()));
+                    }
                     _ => {
                         if let Some(value) = self.extract_from_custom_fields(item, field_name)? {
-                            return Ok(Some(SecretString::new(value.into())));
+                            return Ok(Some(Self::to_secret_string(value)));
                         } else {
                             return Ok(None);
                         }
@@ -1278,28 +1791,28 @@ impl BitwardenProvider {
             let hint_lower = field_hint.to_lowercase();
             if hint_lower.contains("email") || hint_lower.contains("mail") {
                 if let Some(email) = &identity.email {
-                    return Ok(Some(SecretString::new(email.clone().into())));
+                    return Ok(Some(Self::to_secret_string(email)));
                 }
             }
 
             if hint_lower.contains("phone") || hint_lower.contains("tel") {
                 if let Some(phone) = &identity.phone {
-                    return Ok(Some(SecretString::new(phone.clone().into())));
+                    return Ok(Some(Self::to_secret_string(phone)));
                 }
             }
 
             if hint_lower.contains("user") || hint_lower.contains("login") {
                 if let Some(username) = &identity.username {
-                    return Ok(Some(SecretString::new(username.clone().into())));
+                    return Ok(Some(Self::to_secret_string(username)));
                 }
             }
 
             // Default: prefer email, then username
             if let Some(email) = &identity.email {
-                return Ok(Some(SecretString::new(email.clone().into())));
+                return Ok(Some(Self::to_secret_string(email)));
             }
             if let Some(username) = &identity.username {
-                return Ok(Some(SecretString::new(username.clone().into())));
+                return Ok(Some(Self::to_secret_string(username)));
             }
         }
 
@@ -1323,15 +1836,21 @@ impl BitwardenProvider {
             if let Some(field_name) = requested_field {
                 match field_name.to_lowercase().as_str() {
                     "private_key" | "privatekey" | "private" => {
-                        return Ok(ssh_key.private_key.as_ref().map(|k| SecretString::new(k.clone().into())));
+                        return Ok(Self::option_to_secret_string(
+                            ssh_key.private_key.as_deref(),
+                        ));
                     }
-                    "public_key" | "publickey" | "public" => return Ok(ssh_key.public_key.as_ref().map(|k| SecretString::new(k.clone().into()))),
+                    "public_key" | "publickey" | "public" => {
+                        return Ok(Self::option_to_secret_string(ssh_key.public_key.as_deref()));
+                    }
                     "fingerprint" | "key_fingerprint" => {
-                        return Ok(ssh_key.key_fingerprint.as_ref().map(|f| SecretString::new(f.clone().into())));
+                        return Ok(Self::option_to_secret_string(
+                            ssh_key.key_fingerprint.as_deref(),
+                        ));
                     }
                     _ => {
                         if let Some(value) = self.extract_from_custom_fields(item, field_name)? {
-                            return Ok(Some(SecretString::new(value.into())));
+                            return Ok(Some(Self::to_secret_string(value)));
                         } else {
                             return Ok(None);
                         }
@@ -1343,19 +1862,19 @@ impl BitwardenProvider {
             let hint_lower = field_hint.to_lowercase();
             if hint_lower.contains("public") || hint_lower.contains("pub") {
                 if let Some(public_key) = &ssh_key.public_key {
-                    return Ok(Some(SecretString::new(public_key.clone().into())));
+                    return Ok(Some(Self::to_secret_string(public_key)));
                 }
             }
 
             if hint_lower.contains("fingerprint") || hint_lower.contains("finger") {
                 if let Some(fingerprint) = &ssh_key.key_fingerprint {
-                    return Ok(Some(SecretString::new(fingerprint.clone().into())));
+                    return Ok(Some(Self::to_secret_string(fingerprint)));
                 }
             }
 
             // Default: return private key (most common use case for SSH keys)
             if let Some(private_key) = &ssh_key.private_key {
-                return Ok(Some(SecretString::new(private_key.clone().into())));
+                return Ok(Some(Self::to_secret_string(private_key)));
             }
         }
 
@@ -1403,6 +1922,8 @@ impl BitwardenProvider {
         key: &str,
         _profile: &str,
     ) -> Result<Option<SecretString>> {
+        let perf_enabled = std::env::var("SECRETSPEC_PERF_LOG").is_ok();
+
         // For Secrets Manager, we create a secret name based on project and key
         // Profile is encoded in the secret name since SM doesn't have built-in profile support
         let secret_name = format!("{}_{}", project, key);
@@ -1415,9 +1936,33 @@ impl BitwardenProvider {
             args.push(project_id);
         }
 
+        let list_start = if perf_enabled {
+            Some(Instant::now())
+        } else {
+            None
+        };
         match self.execute_bws_command(&args) {
             Ok(output) => {
+                if let Some(start) = list_start {
+                    eprintln!(
+                        "[PERF] BWS secret list took {}ms",
+                        start.elapsed().as_millis()
+                    );
+                }
+
+                let parse_start = if perf_enabled {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 let secrets: Vec<BitwardenSecret> = serde_json::from_str(&output)?;
+                if let Some(start) = parse_start {
+                    eprintln!(
+                        "[PERF] BWS JSON parse took {}μs, {} secrets",
+                        start.elapsed().as_micros(),
+                        secrets.len()
+                    );
+                }
 
                 // Look for a secret with matching key name
                 for secret in secrets {
@@ -1466,7 +2011,19 @@ impl BitwardenProvider {
         }
 
         let output = self.execute_bw_command(&list_args)?;
-        let items: Vec<BitwardenItem> = serde_json::from_str(&output)?;
+
+        // Handle empty output (no search results)
+        let items: Vec<BitwardenItem> = if output.trim().is_empty() {
+            Vec::new()
+        } else {
+            serde_json::from_str(&output).map_err(|e| {
+                SecretSpecError::ProviderOperationFailed(format!(
+                    "Failed to parse Bitwarden item list: {}. Output was: '{}'",
+                    e,
+                    output.chars().take(100).collect::<String>()
+                ))
+            })?
+        };
 
         // Search strategies (same as get method):
         // 1. Exact name match with secretspec format (for compatibility)
@@ -1756,7 +2313,7 @@ impl BitwardenProvider {
                     "Bitwarden CLI (bw) is not installed.\n\nTo install it:\n  - npm: npm install -g @bitwarden/cli\n  - Homebrew: brew install bitwarden-cli\n  - Chocolatey: choco install bitwarden-cli\n  - Download: https://bitwarden.com/help/cli/".to_string(),
                 )
             } else {
-                SecretSpecError::ProviderOperationFailed(e.to_string())
+                SecretSpecError::ProviderOperationFailed(self.sanitize_error_message(&e.to_string()))
             }
         })?;
 
@@ -1775,7 +2332,7 @@ impl BitwardenProvider {
         if !output.status.success() {
             let error_msg = String::from_utf8_lossy(&output.stderr);
             return Err(SecretSpecError::ProviderOperationFailed(
-                error_msg.to_string(),
+                self.sanitize_error_message(&error_msg),
             ));
         }
 
@@ -2044,7 +2601,7 @@ impl BitwardenProvider {
                     "Bitwarden CLI (bw) is not installed.\n\nTo install it:\n  - npm: npm install -g @bitwarden/cli\n  - Homebrew: brew install bitwarden-cli\n  - Chocolatey: choco install bitwarden-cli\n  - Download: https://bitwarden.com/help/cli/".to_string(),
                 )
             } else {
-                SecretSpecError::ProviderOperationFailed(e.to_string())
+                SecretSpecError::ProviderOperationFailed(self.sanitize_error_message(&e.to_string()))
             }
         })?;
 
@@ -2063,7 +2620,7 @@ impl BitwardenProvider {
         if !output.status.success() {
             let error_msg = String::from_utf8_lossy(&output.stderr);
             return Err(SecretSpecError::ProviderOperationFailed(
-                error_msg.to_string(),
+                self.sanitize_error_message(&error_msg),
             ));
         }
 
@@ -2176,20 +2733,33 @@ impl Provider for BitwardenProvider {
     /// - Item retrieval failures
     /// - JSON parsing errors
     fn get(&self, project: &str, key: &str, profile: &str) -> Result<Option<SecretString>> {
-        eprintln!(
-            "DEBUG: BitwardenProvider.get() called with key='{}', service={:?}",
-            key, self.config.service
-        );
-        match self.config.service {
+        let start_time = if std::env::var("SECRETSPEC_PERF_LOG").is_ok() {
+            Some(Instant::now())
+        } else {
+            None
+        };
+
+        let result = match self.config.service {
             BitwardenService::PasswordManager => {
-                eprintln!("DEBUG: Calling get_from_password_manager");
                 self.get_from_password_manager(project, key, profile)
             }
             BitwardenService::SecretsManager => {
-                eprintln!("DEBUG: Calling get_from_secrets_manager");
                 self.get_from_secrets_manager(project, key, profile)
             }
+        };
+
+        // Log performance timing if enabled
+        if let Some(start) = start_time {
+            let duration = start.elapsed();
+            eprintln!(
+                "[PERF] get('{}') took {:?} ({}ms)",
+                key,
+                duration,
+                duration.as_millis()
+            );
         }
+
+        result
     }
 
     /// Stores or updates a secret in Bitwarden.
@@ -2215,14 +2785,33 @@ impl Provider for BitwardenProvider {
     /// - Item creation/update failures
     /// - Temporary file creation errors
     fn set(&self, project: &str, key: &str, value: &SecretString, profile: &str) -> Result<()> {
-        match self.config.service {
+        let start_time = if std::env::var("SECRETSPEC_PERF_LOG").is_ok() {
+            Some(Instant::now())
+        } else {
+            None
+        };
+
+        let result = match self.config.service {
             BitwardenService::PasswordManager => {
                 self.set_to_password_manager(project, key, value, profile)
             }
             BitwardenService::SecretsManager => {
                 self.set_to_secrets_manager(project, key, value, profile)
             }
+        };
+
+        // Log performance timing if enabled
+        if let Some(start) = start_time {
+            let duration = start.elapsed();
+            eprintln!(
+                "[PERF] set('{}') took {:?} ({}ms)",
+                key,
+                duration,
+                duration.as_millis()
+            );
         }
+
+        result
     }
 }
 
