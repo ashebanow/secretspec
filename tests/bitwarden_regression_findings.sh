@@ -14,6 +14,18 @@
 #           type-specific default (set succeeds, get returns the old value)
 #   R4  P2  update matches field names case-sensitively while reads are
 #           case-insensitive (duplicate field, stale reads)
+#
+# Covered findings (second review, 2026-07-30):
+#   R5  P1  get reads a different, substring-matched item when no exact
+#           item of the requested name exists
+#   R6  P1  set updates a substring-matched item instead of creating the
+#           exactly-named one (silently corrupts an unrelated secret)
+#   R7  P1  an explicit secure-note field that is absent falls back to the
+#           legacy `value` field / note body instead of erroring
+#   R8  P1  built-in typed fields (card exp_month etc.) are written as
+#           custom fields on create, so an immediate get returns nothing
+#   R9  P2  an unsupported ?type= value is silently ignored and defaults
+#           to Login instead of being rejected
 set -uo pipefail
 
 # See bitwarden_integration.sh: without a reason, `[project].require_reason`
@@ -75,6 +87,11 @@ regr_canary = { required = false, description = "R1 canary write", ref = { item 
 regr_new_api_key = { required = false, description = "R2 named field on create", ref = { item = "Regr New Login", field = "api_key" } }
 regr_note = { required = false, description = "R3 secure note default", ref = { item = "Regr Note" } }
 regr_case = { required = false, description = "R4 case-insensitive update", ref = { item = "Regr Case Item", field = "api_key" } }
+regr_exact5 = { required = false, description = "R5 substring get", ref = { item = "Regr Exact Five" } }
+regr_target6 = { required = false, description = "R6 substring update", ref = { item = "Regr Target Six" } }
+regr_note7 = { required = false, description = "R7 explicit note field", ref = { item = "Regr Note Seven", field = "config_value" } }
+regr_card8 = { required = false, description = "R8 card builtin on create", ref = { item = "Regr Card Eight", field = "exp_month" } }
+regr_type9 = { required = false, description = "R9 invalid type rejected", ref = { item = "Regr Type Nine" } }
 EOF
 cd "$WORKDIR" || exit 2
 
@@ -124,6 +141,60 @@ if [ "$GOT" = "new-value" ]; then
   report R4 "update matched the existing field case-insensitively" 1
 else
   report R4 "update added a duplicate field; get still returns '$GOT'" 0
+fi
+
+echo "── R5: get must not read a substring-matched item ──"
+mk_item "$(item_json "Regr Exact Five Legacy" 1 '[]' | jq '.login.password = "legacy-secret-5"')" >/dev/null
+bw sync >/dev/null 2>&1
+GOT=$(SS get regr_exact5); RC=$?
+if [ $RC -ne 0 ] || grep -qi "not found" <<<"$GOT"; then
+  report R5 "no exact item: substring match is not read" 1
+else
+  report R5 "get returned another item's secret via substring search" 0 "got '$GOT'"
+fi
+
+echo "── R6: set must not update a substring-matched item ──"
+mk_item "$(item_json "Old Regr Target Six" 1 '[]' | jq '.login.password = "old-password-6"')" >/dev/null
+bw sync >/dev/null 2>&1
+SS set regr_target6 new-secret-6 >/dev/null
+bw sync >/dev/null 2>&1
+EXACT_ID=$(bw list items --search "Regr Target Six" 2>/dev/null | jq -r '[.[] | select(.name == "Regr Target Six")][0].id // empty')
+[ -n "$EXACT_ID" ] && CREATED_IDS+=("$EXACT_ID")
+OLD_PW=$(bw list items --search "Old Regr Target Six" 2>/dev/null | jq -r '[.[] | select(.name == "Old Regr Target Six")][0].login.password')
+if [ -n "$EXACT_ID" ] && [ "$OLD_PW" = "old-password-6" ]; then
+  report R6 "set created the exact item; the substring match is untouched" 1
+else
+  report R6 "set overwrote the substring-matched item instead of creating one" 0 "old item password is now '$OLD_PW'"
+fi
+
+echo "── R7: absent explicit note field must not fall back ──"
+mk_item "$(item_json "Regr Note Seven" 2 '[{"name":"value","value":"other-secret-7","type":1}]')" >/dev/null
+bw sync >/dev/null 2>&1
+GOT=$(SS get regr_note7) || true
+if grep -qi "not found" <<<"$GOT"; then
+  report R7 "missing field=config_value reads as not-found" 1
+else
+  report R7 "explicit field=config_value returned a different field" 0 "got '$GOT'"
+fi
+
+echo "── R8: built-in card fields must survive create ──"
+"$BIN" set regr_card8 12 --provider 'bw://?type=card' >/dev/null 2>&1
+bw sync >/dev/null 2>&1
+CARD_ID=$(bw list items --search "Regr Card Eight" 2>/dev/null | jq -r '[.[] | select(.name == "Regr Card Eight")][0].id // empty')
+[ -n "$CARD_ID" ] && CREATED_IDS+=("$CARD_ID")
+GOT=$("$BIN" get regr_card8 --provider 'bw://?type=card' 2>&1) || true
+if [ "$GOT" = "12" ]; then
+  report R8 "exp_month readable right after create" 1
+else
+  report R8 "set stored exp_month as a custom field; get reads the null card.expMonth" 0 "got '$GOT'"
+fi
+
+echo "── R9: unsupported ?type= must be rejected, not defaulted ──"
+OUT=$("$BIN" get regr_type9 --provider 'bw://?type=sshkee' 2>&1) || true
+if grep -qi "sshkee" <<<"$OUT"; then
+  report R9 "typo'd type= is reported as a configuration error" 1
+else
+  report R9 "type=sshkee silently ignored (falls back to Login)" 0
 fi
 
 echo
