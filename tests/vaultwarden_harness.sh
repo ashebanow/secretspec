@@ -16,6 +16,10 @@
 #
 # Requirements: docker, python3 (+`cryptography`, auto-installed in a venv),
 # bw CLI, jq, cargo. Fixture credentials are committable constants, not secrets.
+# The vaultwarden image must be recent: images older than ~mid-2026 don't
+# expose the account public key in /api/accounts/profile, so the organization
+# fixture aborts with "no publicKey in profile response" — run
+# `docker pull vaultwarden/server:latest` if you hit that.
 #
 # The devenv shell provides the docker *client*; the container runtime itself is
 # yours to supply and start (Docker Desktop, colima, or `podman machine start`
@@ -86,6 +90,12 @@ echo "── 3/5 bw login (isolated appdata) ──"
 export BITWARDENCLI_APPDATA_DIR="$HARNESS_DIR/bw-appdata"
 export NODE_TLS_REJECT_UNAUTHORIZED=0   # self-signed internal cert, local only
 mkdir -p "$BITWARDENCLI_APPDATA_DIR"
+# The developer's own secretspec user config must not leak into the run: a
+# `[defaults] profile` in ~/.config/secretspec/config.toml fails every set/get
+# with "Invalid profile" (the test projects only define [profiles.default]).
+# Same isolation the appdata dir above gives the bw CLI.
+export XDG_CONFIG_HOME="$HARNESS_DIR/xdg-config"
+mkdir -p "$XDG_CONFIG_HOME"
 bw config server "https://localhost:$TLS_PORT" >/dev/null
 BW_SESSION=$(bw login "$FIXTURE_EMAIL" "$FIXTURE_PASSWORD" --raw)
 export BW_SESSION
