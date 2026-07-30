@@ -517,3 +517,7 @@ fi
 # also restores any secretspec.toml that was here before the run.
 
 echo -e "\n${BLUE}Testing complete!${NC}"
+
+# Callers (vaultwarden_harness.sh, CI) must see failed assertions in the exit
+# code, or a failing suite reads as green end-to-end.
+[ "$TESTS_FAILED" -eq 0 ] || exit 1
